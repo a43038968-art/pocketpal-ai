@@ -5,11 +5,10 @@
  *   - Light values: current `createBaseColors(AppTheme.Light)` +
  *     `createSemanticColors(_, false)` output from `src/utils/theme.ts`,
  *     preserved verbatim (no visual regression).
- *   - Dark values: extracted from canonical Figma `RZxDJea4t6jnBZrV4YBacF`,
- *     dark band `3011:*`. Where the canonical dark binding disagreed with
- *     the current dark Theme value at a key with visible consumers, the
- *     current dark value wins to avoid visual regression; the disagreement
- *     is tracked as a designer follow-up.
+ *   - Dark values: restyled to a JanitorAI-like aesthetic (graphite-blue
+ *     backgrounds, indigo/violet accents, soft lavender-grey secondary text).
+ *     Previously extracted from canonical Figma `RZxDJea4t6jnBZrV4YBacF`,
+ *     dark band `3011:*`.
  *
  * `withOpacity` calls are deferred to a util (not inlined as literals) so
  * the output is byte-identical to today's runtime computation — this is
@@ -161,33 +160,37 @@ export const lightColors: TokenColors = {
   },
 };
 
-// Dark base values from canonical Figma. Where the canonical dark binding
-// differs visibly from the current dark Theme value, the current value
-// wins to avoid visual regression (tracked as a designer follow-up).
-const DARK_PRIMARY = '#DADDE6';
-const DARK_SECONDARY = '#95ABE6';
-const DARK_TERTIARY = '#80E6E4';
+// Dark base values — JanitorAI-style palette:
+//   background  #111116  deep graphite with a faint blue undertone
+//   surface     #1C1C24  cards, inputs
+//   variant     #252530  message bubbles, raised elements
+//   border      #2E2E3A  thin dark borders
+//   accent      #7C3AED / #8B5CF6  neon violet / indigo
+//   text        #F4F4F8 (primary), #A1A1B5 (secondary)
+const DARK_PRIMARY = '#8B5CF6';
+const DARK_SECONDARY = '#7C3AED';
+const DARK_TERTIARY = '#A78BFA';
 const DARK_ERROR = '#FF653F';
-const DARK_BACKGROUND = '#000000';
-const DARK_ON_BACKGROUND = '#ffffff';
-const DARK_SURFACE = '#0E0E0E';
-const DARK_ON_SURFACE = '#E2E2E2';
-const DARK_INVERSE_ON_SURFACE = '#333333';
+const DARK_BACKGROUND = '#111116';
+const DARK_ON_BACKGROUND = '#F4F4F8';
+const DARK_SURFACE = '#1C1C24';
+const DARK_ON_SURFACE = '#F4F4F8';
+const DARK_INVERSE_ON_SURFACE = '#1C1C24';
 
 export const darkColors: TokenColors = {
-  // MD3 base palette (dark) — verbatim from canonical Figma
+  // MD3 base palette (dark)
   primary: DARK_PRIMARY,
-  onPrimary: '#44464C',
-  primaryContainer: '#5B5E66',
-  onPrimaryContainer: '#DEE0E6',
+  onPrimary: '#FFFFFF',
+  primaryContainer: '#3B2A78',
+  onPrimaryContainer: '#E4DAFF',
   secondary: DARK_SECONDARY,
-  onSecondary: '#11214C',
-  secondaryContainer: '#424242',
-  onSecondaryContainer: '#E0E0E0',
+  onSecondary: '#FFFFFF',
+  secondaryContainer: '#2E2250',
+  onSecondaryContainer: '#D9CCFF',
   tertiary: DARK_TERTIARY,
-  onTertiary: '#014C4C',
-  tertiaryContainer: '#016665',
-  onTertiaryContainer: '#9EE6E5',
+  onTertiary: '#1E1442',
+  tertiaryContainer: '#3A2D6B',
+  onTertiaryContainer: '#E4DAFF',
   error: DARK_ERROR,
   onError: '#4C100D',
   errorContainer: '#661511',
@@ -196,43 +199,42 @@ export const darkColors: TokenColors = {
   onBackground: DARK_ON_BACKGROUND,
   surface: DARK_SURFACE,
   onSurface: DARK_ON_SURFACE,
-  surfaceVariant: '#646466',
-  onSurfaceVariant: '#e3e4e6',
-  outline: '#444444',
-  outlineVariant: '#a1a1a1',
-  mutedLight: '#3a3937',
-  // Figma `Color/Secondary/Default` — dark binding from canonical file.
-  secondaryDefault: '#2a2928',
+  surfaceVariant: '#252530',
+  onSurfaceVariant: '#A1A1B5',
+  outline: '#2E2E3A',
+  outlineVariant: '#3D3D4D',
+  mutedLight: '#252530',
+  // Figma `Color/Secondary/Default` — dark binding restyled to graphite-blue.
+  secondaryDefault: '#2E2E3A',
   // MD3 extras
-  surfaceDisabled: withOpacity('#333333', 0.12),
-  onSurfaceDisabled: withOpacity('#e5e5e6', 0.38),
-  inverseSurface: '#e5e5e6',
+  surfaceDisabled: withOpacity('#2E2E3A', 0.12),
+  onSurfaceDisabled: withOpacity('#A1A1B5', 0.38),
+  inverseSurface: '#F4F4F8',
   inverseOnSurface: DARK_INVERSE_ON_SURFACE,
-  inversePrimary: '#5B5E66',
+  inversePrimary: '#7C3AED',
   inverseSecondary: LIGHT_SECONDARY, // md3BaseColors.secondary used in current code
   shadow: '#ffffff',
   scrim: 'rgba(0, 0, 0, 0.25)',
-  backdrop: 'rgba(66, 66, 66, 0.8)',
+  backdrop: 'rgba(17, 17, 22, 0.8)',
 
-  // Semantic surface variants (dark derives via surface-tint math)
-  // Explicit binding pending in a later design-system phase.
-  surfaceContainerHighest: withOpacity(DARK_SURFACE, 0.22),
-  surfaceContainerHigh: withOpacity(DARK_SURFACE, 0.16),
-  surfaceContainer: withOpacity(DARK_SURFACE, 0.12),
-  surfaceContainerLow: withOpacity(DARK_SURFACE, 0.08),
-  surfaceContainerLowest: withOpacity(DARK_SURFACE, 0.04),
-  surfaceDim: withOpacity(DARK_SURFACE, 0.06),
-  surfaceBright: withOpacity(DARK_SURFACE, 0.24),
+  // Semantic surface variants (dark: solid graphite-blue steps, darkest to lightest)
+  surfaceContainerHighest: '#252530',
+  surfaceContainerHigh: '#20202A',
+  surfaceContainer: '#1C1C24',
+  surfaceContainerLow: '#17171E',
+  surfaceContainerLowest: '#13131A',
+  surfaceDim: '#0D0D12',
+  surfaceBright: '#2E2E3A',
 
   // Text
   text: DARK_ON_BACKGROUND,
-  textSecondary: withOpacity(DARK_ON_SURFACE, 0.5),
+  textSecondary: '#A1A1B5',
   inverseText: DARK_INVERSE_ON_SURFACE,
   inverseTextSecondary: withOpacity(DARK_INVERSE_ON_SURFACE, 0.5),
 
   // Border / placeholder
-  border: withOpacity(DARK_ON_SURFACE, 0.05),
-  placeholder: withOpacity(DARK_ON_SURFACE, 0.3),
+  border: '#2E2E3A',
+  placeholder: withOpacity('#A1A1B5', 0.5),
 
   // Interactive state opacities
   stateLayerOpacity: 0.12,
@@ -242,16 +244,16 @@ export const darkColors: TokenColors = {
   focusStateOpacity: stateLayerOpacity.focus,
 
   // Menu
-  menuBackground: '#2a2a2a',
+  menuBackground: '#1C1C24',
   menuBackgroundDimmed: withOpacity(DARK_SURFACE, 0.9),
-  menuBackgroundActive: withOpacity(DARK_PRIMARY, 0.08),
-  menuSeparator: withOpacity(DARK_PRIMARY, 0.5),
+  menuBackgroundActive: withOpacity(DARK_PRIMARY, 0.16),
+  menuSeparator: '#2E2E3A',
   menuGroupSeparator: withOpacity('#FFFFFF', 0.08),
   menuText: DARK_ON_SURFACE,
   menuDangerText: DARK_ERROR,
 
   // Messages
-  authorBubbleBackground: '#212121',
+  authorBubbleBackground: '#252530',
   receivedMessageDocumentIcon: DARK_PRIMARY,
   sentMessageDocumentIcon: DARK_ON_SURFACE,
   userAvatarImageBackground: 'transparent',
@@ -261,15 +263,15 @@ export const darkColors: TokenColors = {
     DARK_TERTIARY,
     DARK_ERROR,
   ],
-  searchBarBackground: 'rgba(28, 28, 30, 0.92)',
+  searchBarBackground: '#1C1C24',
 
   // Thinking bubble
-  thinkingBubbleBackground: '#142e4d',
-  thinkingBubbleText: '#6abaff',
-  thinkingBubbleBorder: 'rgba(74, 140, 199, 0.6)',
-  thinkingBubbleShadow: '#4a9fff',
-  thinkingBubbleChevronBackground: 'rgba(74, 140, 199, 0.15)',
-  thinkingBubbleChevronBorder: 'rgba(74, 140, 199, 0.3)',
+  thinkingBubbleBackground: '#1E1833',
+  thinkingBubbleText: '#C4B5FD',
+  thinkingBubbleBorder: 'rgba(139, 92, 246, 0.5)',
+  thinkingBubbleShadow: '#8B5CF6',
+  thinkingBubbleChevronBackground: 'rgba(139, 92, 246, 0.15)',
+  thinkingBubbleChevronBorder: 'rgba(139, 92, 246, 0.3)',
 
   // Status bar
   bgStatusActive: '#22c55e',
@@ -277,9 +279,9 @@ export const darkColors: TokenColors = {
   statusLoaded: '#34c768',
 
   // Buttons
-  btnPrimaryBg: '#0f1629',
-  btnPrimaryBorder: '#192645',
-  btnPrimaryText: '#93c5fd',
+  btnPrimaryBg: '#1E1640',
+  btnPrimaryBorder: '#4C2A9C',
+  btnPrimaryText: '#C4B5FD',
   btnReadyBg: '#052e16',
   btnReadyBorder: '#166534',
   btnReadyText: '#6ee7b7',
@@ -288,7 +290,7 @@ export const darkColors: TokenColors = {
   btnDownloadText: '#34d399',
 
   // Icons
-  iconModelTypeText: '#93c5fd',
+  iconModelTypeText: '#A78BFA',
   iconModelTypeVision: '#c4b5fd',
   iconModelTypeAudio: '#fdba74',
 
