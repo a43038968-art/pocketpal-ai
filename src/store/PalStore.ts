@@ -10,6 +10,8 @@
  * - PalsHub integration: Support for marketplace pals with custom parameters
  * - Extensible: Easy to add new parameter types (text, select, datetime_tag)
  * - Migration: Automatically migrates data from legacy PalStore on startup
+ * - User Persona: name / gender / description of the user, persisted locally
+ * - Lorebook: keyword-triggered lore entries, persisted locally
  *
  * @see src/types/pal.ts for type definitions
  * @see src/utils/pal-migration.ts for migration utilities
@@ -52,6 +54,49 @@ import {downloadPalThumbnail, deletePalThumbnail} from '../utils/imageUtils';
 // (check key, find existing, create, set key) instead of a third copy.
 const LOOKIE_SEEDED_KEY = 'PalStore.builtin.Lookie.seeded';
 const PIP_SEEDED_KEY = 'PalStore.builtin.Pip.seeded';
+
+// AsyncStorage keys for the User Persona and Lorebook sections.
+const USER_PERSONA_KEY = 'PalStore.userPersona';
+const LOREBOOK_KEY = 'PalStore.lorebook';
+
+// Max number of lorebook entries returned by getTriggeredEntries.
+const MAX_TRIGGERED_LOREBOOK_ENTRIES = 3;
+
+/**
+ * User Persona — who the user is in the conversation.
+ */
+export interface UserPersona {
+  name: string;
+  gender: string;
+  /** Short description of appearance / role. */
+  description: string;
+  isEnabled: boolean;
+}
+
+/**
+ * A single Lorebook entry. It is injected into the context when one of its
+ * keywords (or word roots) appears in the recent messages.
+ */
+export interface LorebookEntry {
+  id: string;
+  title: string;
+  /** Keywords / word roots, matched case-insensitively as substrings. */
+  keywords: string[];
+  /** Reference text to inject when the entry is triggered. */
+  content: string;
+  isEnabled: boolean;
+}
+
+export type LorebookEntryInput = Omit<LorebookEntry, 'id' | 'isEnabled'> & {
+  isEnabled?: boolean;
+};
+
+const DEFAULT_USER_PERSONA: UserPersona = {
+  name: '',
+  gender: '',
+  description: '',
+  isEnabled: false,
+};
 
 interface CreatorUpdateContext {
   fresh: Pal;
@@ -131,6 +176,12 @@ class PalStore {
   migrationComplete: boolean = false;
   migrationVersion: string = '1.0';
 
+  // User Persona (persisted in AsyncStorage)
+  userPersona: UserPersona = {...DEFAULT_USER_PERSONA};
+
+  // Lorebook (persisted in AsyncStorage)
+  lorebook: LorebookEntry[] = [];
+
   readonly ready: Promise<void>;
   private palshubInsertChains = new Map<string, Promise<unknown>>();
 
@@ -155,6 +206,9 @@ class PalStore {
 
       // Load pals from database
       await this.loadPalsFromDatabase();
+
+      // Load User Persona and Lorebook from device storage
+      await this.loadUserPersonaAndLorebook();
 
       // Initialize Lookie pal after database is loaded
       await this.initializeLookiePal();
@@ -289,6 +343,308 @@ class PalStore {
     return this.pals.find(p => p.id === id);
   };
 
+  // ---------------------------------------------------------------------------
+  // User Persona
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Loads the User Persona and Lorebook from AsyncStorage.
+   * Corrupt or missing data falls back to defaults and never throws.
+   */
+  private loadUserPersonaAndLorebook = async (): Promise<void> => {
+    try {
+      const [personaRaw, lorebookRaw] = await Promise.all([
+        AsyncStorage.getItem(USER_PERSONA_KEY),
+        AsyncStorage.getItem(LOREBOOK_KEY),
+      ]);
+
+      let persona: UserPersona = {...DEFAULT_USER_PERSONA};
+      if (personaRaw) {
+        try {
+          const parsed = JSON.parse(personaRaw);
+          persona = {
+            name: typeof parsed?.name === 'string' ? parsed.name : '',
+            gender: typeof parsed?.gender === 'string' ? parsed.gender : '',
+            description:
+              typeof parsed?.description === 'string' ? parsed.description : '',
+            isEnabled: parsed?.isEnabled === true,
+          };
+        } catch (parseError) {
+          console.warn('Failed to parse stored user persona:', parseError);
+        }
+      }
+
+      let entries: LorebookEntry[] = [];
+      if (lorebookRaw) {
+        try {
+          const parsed = JSON.parse(lorebookRaw);
+          if (Array.isArray(parsed)) {
+            entries = parsed
+              .filter(e => e != null && typeof e === 'object')
+              .map(e => ({
+                id: typeof e.id === 'string' && e.id ? e.id : uuidv4(),
+                title: typeof e.title === 'string' ? e.title : '',
+                keywords: Array.isArray(e.keywords)
+                  ? e.keywords.filter(
+                      (k: unknown): k is string => typeof k === 'string',
+                    )
+                  : [],
+                content: typeof e.content === 'string' ? e.content : '',
+                isEnabled: e.isEnabled !== false,
+              }));
+          }
+        } catch (parseError) {
+          console.warn('Failed to parse stored lorebook:', parseError);
+        }
+      }
+
+      runInAction(() => {
+        this.userPersona = persona;
+        this.lorebook = entries;
+      });
+    } catch (error) {
+      console.error('Error loading user persona / lorebook:', error);
+    }
+  };
+
+  private persistUserPersona = async (): Promise<void> => {
+    try {
+      await AsyncStorage.setItem(
+        USER_PERSONA_KEY,
+        JSON.stringify(this.userPersona),
+      );
+    } catch (error) {
+      console.error('Error saving user persona:', error);
+    }
+  };
+
+  private persistLorebook = async (): Promise<void> => {
+    try {
+      await AsyncStorage.setItem(LOREBOOK_KEY, JSON.stringify(this.lorebook));
+    } catch (error) {
+      console.error('Error saving lorebook:', error);
+    }
+  };
+
+  /**
+   * Updates one or more User Persona fields and saves automatically.
+   */
+  updateUserPersona = async (updates: Partial<UserPersona>): Promise<void> => {
+    runInAction(() => {
+      this.userPersona = {...this.userPersona, ...updates};
+    });
+    await this.persistUserPersona();
+  };
+
+  /**
+   * Turns the User Persona on or off and saves automatically.
+   */
+  setUserPersonaEnabled = async (isEnabled: boolean): Promise<void> => {
+    await this.updateUserPersona({isEnabled});
+  };
+
+  /**
+   * Resets the User Persona to its defaults (empty, disabled).
+   */
+  resetUserPersona = async (): Promise<void> => {
+    runInAction(() => {
+      this.userPersona = {...DEFAULT_USER_PERSONA};
+    });
+    await this.persistUserPersona();
+  };
+
+  /**
+   * Returns the persona only if it is enabled and has some content.
+   * Convenient for prompt builders.
+   */
+  get activeUserPersona(): UserPersona | null {
+    const p = this.userPersona;
+    if (!p.isEnabled) {
+      return null;
+    }
+    if (!p.name.trim() && !p.gender.trim() && !p.description.trim()) {
+      return null;
+    }
+    return p;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Lorebook
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Adds a new lorebook entry and saves automatically.
+   */
+  addLorebookEntry = async (
+    data: LorebookEntryInput,
+  ): Promise<LorebookEntry> => {
+    const entry: LorebookEntry = {
+      id: uuidv4(),
+      title: data.title,
+      keywords: data.keywords
+        .map(k => k.trim())
+        .filter(k => k.length > 0),
+      content: data.content,
+      isEnabled: data.isEnabled ?? true,
+    };
+    runInAction(() => {
+      this.lorebook.push(entry);
+    });
+    await this.persistLorebook();
+    return entry;
+  };
+
+  /**
+   * Edits an existing lorebook entry and saves automatically.
+   * Returns false if no entry with this id exists.
+   */
+  updateLorebookEntry = async (
+    id: string,
+    updates: Partial<Omit<LorebookEntry, 'id'>>,
+  ): Promise<boolean> => {
+    const index = this.lorebook.findIndex(e => e.id === id);
+    if (index === -1) {
+      return false;
+    }
+    runInAction(() => {
+      const current = this.lorebook[index];
+      this.lorebook[index] = {
+        ...current,
+        ...updates,
+        keywords: updates.keywords
+          ? updates.keywords.map(k => k.trim()).filter(k => k.length > 0)
+          : current.keywords,
+        id: current.id,
+      };
+    });
+    await this.persistLorebook();
+    return true;
+  };
+
+  /**
+   * Turns a single lorebook entry on or off.
+   */
+  setLorebookEntryEnabled = async (
+    id: string,
+    isEnabled: boolean,
+  ): Promise<boolean> => {
+    return this.updateLorebookEntry(id, {isEnabled});
+  };
+
+  /**
+   * Deletes a lorebook entry and saves automatically.
+   * Returns false if no entry with this id exists.
+   */
+  deleteLorebookEntry = async (id: string): Promise<boolean> => {
+    const index = this.lorebook.findIndex(e => e.id === id);
+    if (index === -1) {
+      return false;
+    }
+    runInAction(() => {
+      this.lorebook.splice(index, 1);
+    });
+    await this.persistLorebook();
+    return true;
+  };
+
+  /**
+   * Gets a lorebook entry by ID.
+   */
+  getLorebookEntryById = (id: string): LorebookEntry | undefined => {
+    return this.lorebook.find(e => e.id === id);
+  };
+
+  /**
+   * Finds enabled lorebook entries whose keywords appear in the recent
+   * messages (case-insensitive substring match, so word roots work) and
+   * returns up to 3 best matches.
+   *
+   * Ranking: more distinct keywords matched first, then more total
+   * occurrences, then the entry whose match appears in a more recent message
+   * (recentMessages are expected oldest -> newest), then lorebook order.
+   */
+  getTriggeredEntries = (recentMessages: string[]): LorebookEntry[] => {
+    if (!recentMessages || recentMessages.length === 0) {
+      return [];
+    }
+
+    const messages = recentMessages.map(m => (m ?? '').toLowerCase());
+
+    const countOccurrences = (haystack: string, needle: string): number => {
+      let count = 0;
+      let from = 0;
+      while (true) {
+        const at = haystack.indexOf(needle, from);
+        if (at === -1) {
+          return count;
+        }
+        count += 1;
+        from = at + needle.length;
+      }
+    };
+
+    const scored: {
+      entry: LorebookEntry;
+      distinct: number;
+      occurrences: number;
+      lastMessageIndex: number;
+      order: number;
+    }[] = [];
+
+    this.lorebook.forEach((entry, order) => {
+      if (!entry.isEnabled) {
+        return;
+      }
+      const keywords = Array.from(
+        new Set(
+          entry.keywords
+            .map(k => k.trim().toLowerCase())
+            .filter(k => k.length > 0),
+        ),
+      );
+      if (keywords.length === 0) {
+        return;
+      }
+
+      let distinct = 0;
+      let occurrences = 0;
+      let lastMessageIndex = -1;
+
+      for (const keyword of keywords) {
+        let matched = false;
+        messages.forEach((message, messageIndex) => {
+          const n = countOccurrences(message, keyword);
+          if (n > 0) {
+            matched = true;
+            occurrences += n;
+            if (messageIndex > lastMessageIndex) {
+              lastMessageIndex = messageIndex;
+            }
+          }
+        });
+        if (matched) {
+          distinct += 1;
+        }
+      }
+
+      if (distinct > 0) {
+        scored.push({entry, distinct, occurrences, lastMessageIndex, order});
+      }
+    });
+
+    scored.sort(
+      (a, b) =>
+        b.distinct - a.distinct ||
+        b.occurrences - a.occurrences ||
+        b.lastMessageIndex - a.lastMessageIndex ||
+        a.order - b.order,
+    );
+
+    return scored
+      .slice(0, MAX_TRIGGERED_LOREBOOK_ENTRIES)
+      .map(item => item.entry);
+  };
+
   // PalsHub integration methods
 
   /**
@@ -324,6 +680,7 @@ class PalStore {
     build: () => Promise<Pal>,
   ): Promise<{pal: Pal; created: boolean}> => {
     const previous =
+       const previous =
       this.palshubInsertChains.get(palshubId) ?? Promise.resolve();
     const run = previous
       .catch(() => undefined)
@@ -913,3 +1270,4 @@ export const palStore = new PalStore();
 // Export types for external use
 export type {Pal} from '../types/pal';
 export type {LegacyPalData} from '../utils/pal-migration';
+  
