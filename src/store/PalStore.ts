@@ -680,7 +680,6 @@ class PalStore {
     build: () => Promise<Pal>,
   ): Promise<{pal: Pal; created: boolean}> => {
     const previous =
-       const previous =
       this.palshubInsertChains.get(palshubId) ?? Promise.resolve();
     const run = previous
       .catch(() => undefined)
