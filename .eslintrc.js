@@ -151,5 +151,14 @@ module.exports = {
         'no-restricted-syntax': ['error', AGENT_SETTER],
       },
     },
+      {
+      files: ['**/*.{ts,tsx,js,jsx}'],
+      rules: {
+        'prettier/prettier': 'off',
+      },
+    },
+      ],
+};
+
   ],
 };
