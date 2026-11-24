@@ -19,6 +19,7 @@ import {derivedText} from '../utils/chat';
 import {palStore} from './PalStore';
 import {deriveToolSchemas} from '../services/talents';
 import {AgentUiState, initialAgentUiState} from '../services/agent';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 /**
  * Update payload accepted by `updateMessage` / `updateMessageStreaming`.
@@ -46,6 +47,13 @@ export interface SessionMetaData {
   pinned?: boolean;
   settingsSource: 'pal' | 'custom'; // Explicit choice: use pal settings or custom settings
   messagesLoaded?: boolean; // Track if messages are loaded for lazy loading
+  // Roleplay extensions (persisted per session in AsyncStorage, see
+  // `persistRoleplayExtras`; no DB schema change required).
+  roleplayConfig?: RoleplayConfig;
+  /** Pal ids taking part in a group chat (group mode needs 2+ members). */
+  groupPalIds?: string[];
+  /** Group member who answers next. */
+  activeSpeakerPalId?: string;
 }
 
 interface SessionGroup {
@@ -71,6 +79,248 @@ export const NEW_CHAT_DRAFT_KEY = '__new_chat__';
 export const defaultCompletionSettings = {...defaultCompletionParams};
 delete defaultCompletionSettings.prompt;
 delete defaultCompletionSettings.stop;
+
+// ---------------------------------------------------------------------------
+// Roleplay: settings, group chat and prompt-pipeline helpers
+// ---------------------------------------------------------------------------
+
+export interface RoleplayConfig {
+  /** Global system prompt (English), placed at the very top of the prompt. */
+  modelSystemOverride: string;
+  /** Scene anchor silently glued in front of the latest user message. */
+  depthPrompt: string;
+  /** Beginning of the bot's reply, appended as the start of the assistant turn. */
+  prefill: string;
+  /** Small-model mode: greeting + last 8 turns, long *descriptions* cut from old turns. */
+  is3BFocusMode: boolean;
+  /** Strip junk tags and cut replies where the bot starts speaking for the user. */
+  autoCleanResponse: boolean;
+}
+
+export const defaultRoleplayConfig: RoleplayConfig = {
+  modelSystemOverride: '',
+  depthPrompt: '',
+  prefill: '',
+  is3BFocusMode: false,
+  autoCleanResponse: false,
+};
+
+export type RoleplayRole = 'system' | 'user' | 'assistant';
+
+export interface RoleplayChatMessage {
+  role: RoleplayRole;
+  content: string;
+}
+
+export interface RoleplayPromptResult {
+  /** Ready-to-send chat messages (one leading system message, then history). */
+  messages: RoleplayChatMessage[];
+  /** Full text of the trailing assistant message ('' when there is none). */
+  prefill: string;
+  /** Prefill as the user wrote it (without the group speaker tag). */
+  displayPrefill: string;
+  speakerPalId?: string;
+  speakerName: string;
+  userName: string;
+  isGroup: boolean;
+  /** Extra stop strings that keep the bot from writing the user's / others' lines. */
+  extraStopWords: string[];
+}
+
+export interface BuildRoleplayMessagesOptions {
+  sessionId?: string;
+  /** Override how a message is recognised as the user's. */
+  isUserMessage?: (message: MessageType.Any) => boolean;
+}
+
+type RoleplayExtras = Pick<
+  SessionMetaData,
+  'roleplayConfig' | 'groupPalIds' | 'activeSpeakerPalId'
+>;
+
+interface RoleplayTurn {
+  role: 'user' | 'assistant';
+  text: string;
+  speakerPalId?: string;
+}
+
+const ROLEPLAY_STORAGE_PREFIX = 'ChatSessionStore.roleplay.';
+
+// Author id of the human user in chat messages (the value of `user.id` in
+// utils/chat). Pass `isUserMessage` to buildRoleplayMessages if yours differs.
+const USER_AUTHOR_ID = 'y9d7f8pgn';
+
+const FOCUS_MODE_KEPT_TURNS = 8; // last N turns kept in 3B focus mode
+const FOCUS_MODE_FULL_TURNS = 2; // newest turns that keep their *descriptions*
+const FOCUS_MODE_LONG_ACTION_CHARS = 60; // *...* longer than this is cut
+const LOREBOOK_CONTEXT_MESSAGES = 6; // recent turns scanned for lore keywords
+
+const JUNK_TOKEN_PATTERNS: RegExp[] = [
+  /<\|start_header_id\|>[^<]*<\|end_header_id\|>/g,
+  /<\|im_start\|>\s*(?:assistant|user|system)?/gi,
+  /<\|[^|<>\n]{1,40}\|>/g,
+  /<\/?s>/g,
+  /\[\/?INST\]/gi,
+  /<<\/?SYS>>/gi,
+  /<\/?(?:start|end)_of_turn>/gi,
+];
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function defaultIsUserMessage(message: MessageType.Any): boolean {
+  if (message.type === 'assistant_turn') {
+    return false;
+  }
+  return (message as any).author?.id === USER_AUTHOR_ID;
+}
+
+/** Replaces {{user}} / {{char}} (case-insensitive). */
+function applyRoleplayPlaceholders(
+  text: string,
+  userName: string,
+  charName: string,
+): string {
+  return text
+    .replace(/\{\{\s*user\s*\}\}/gi, () => userName)
+    .replace(/\{\{\s*char\s*\}\}/gi, () => charName);
+}
+
+/** Fills simple {{key}} placeholders from the pal's parameter values. */
+function renderPalParameters(
+  text: string,
+  parameters?: Record<string, any>,
+): string {
+  if (!parameters) {
+    return text;
+  }
+  return text.replace(
+    /\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g,
+    (match: string, key: string) => {
+      const lowered = key.toLowerCase();
+      if (lowered === 'user' || lowered === 'char') {
+        return match;
+      }
+      const value = parameters[key];
+      return value === undefined || value === null ? match : String(value);
+    },
+  );
+}
+
+/** Removes long *...* descriptions, keeping short actions like *smiles*. */
+function stripLongActions(text: string): string {
+  const stripped = text
+    .replace(/\*([^*]+)\*/g, (match: string, inner: string) =>
+      inner.length > FOCUS_MODE_LONG_ACTION_CHARS ? '' : match,
+    )
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return stripped.length > 0 ? stripped : text.trim();
+}
+
+function hasSpeakerTag(text: string): boolean {
+  return /^\[[^\]\n]{1,40}\]\s*:/.test(text);
+}
+
+function stripLeadingSpeakerTags(text: string, names: string[]): string {
+  let result = text;
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const name of names) {
+      const pattern = new RegExp(
+        `^\\s*\\[${escapeRegExp(name)}\\]\\s*[:：]\\s*`,
+        'i',
+      );
+      if (pattern.test(result)) {
+        result = result.replace(pattern, '');
+        changed = true;
+      }
+    }
+  }
+  return result;
+}
+
+/** Cuts the text where a new line starts with "<Name>:" / "[Name]:" / "**Name**:". */
+function cutAtSpeakerLabel(text: string, names: string[]): string {
+  let cutAt = -1;
+  for (const name of names) {
+    const pattern = new RegExp(
+      `(?:^|\\n)[ \\t]*(?:\\[|\\*\\*|<)?${escapeRegExp(name)}(?:\\]|\\*\\*|>)?[ \\t]*[:：]`,
+      'i',
+    );
+    const match = pattern.exec(text);
+    if (match && match.index > 0 && (cutAt === -1 || match.index < cutAt)) {
+      cutAt = match.index;
+    }
+  }
+  return cutAt === -1 ? text : text.slice(0, cutAt);
+}
+
+/** Pure, idempotent cleaner: safe to run on every streamed partial. */
+function cleanRoleplayText(
+  text: string,
+  cutNames: string[],
+  leadingTagNames: string[],
+): string {
+  let result = text;
+  for (const pattern of JUNK_TOKEN_PATTERNS) {
+    result = result.replace(pattern, '');
+  }
+  result = stripLeadingSpeakerTags(result, leadingTagNames);
+  result = cutAtSpeakerLabel(result, cutNames);
+  return result.trimEnd();
+}
+
+function uniqueNonEmpty(values: (string | undefined)[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values) {
+    const trimmed = value?.trim();
+    if (trimmed && !seen.has(trimmed.toLowerCase())) {
+      seen.add(trimmed.toLowerCase());
+      out.push(trimmed);
+    }
+  }
+  return out;
+}
+
+function parseRoleplayExtras(raw: string | null): RoleplayExtras | undefined {
+  if (!raw) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    const extras: RoleplayExtras = {};
+    const cfg = parsed?.roleplayConfig;
+    if (cfg && typeof cfg === 'object') {
+      extras.roleplayConfig = {
+        modelSystemOverride:
+          typeof cfg.modelSystemOverride === 'string'
+            ? cfg.modelSystemOverride
+            : '',
+        depthPrompt: typeof cfg.depthPrompt === 'string' ? cfg.depthPrompt : '',
+        prefill: typeof cfg.prefill === 'string' ? cfg.prefill : '',
+        is3BFocusMode: cfg.is3BFocusMode === true,
+        autoCleanResponse: cfg.autoCleanResponse === true,
+      };
+    }
+    if (Array.isArray(parsed?.groupPalIds)) {
+      extras.groupPalIds = parsed.groupPalIds.filter(
+        (id: unknown): id is string => typeof id === 'string',
+      );
+    }
+    if (typeof parsed?.activeSpeakerPalId === 'string') {
+      extras.activeSpeakerPalId = parsed.activeSpeakerPalId;
+    }
+    return extras;
+  } catch (error) {
+    console.warn('Failed to parse stored roleplay settings:', error);
+    return undefined;
+  }
+}
 
 class ChatSessionStore {
   sessions: SessionMetaData[] = [];
@@ -124,6 +374,10 @@ class ChatSessionStore {
   dismissedBannerVariants: Set<BannerVariant> = new Set();
   consecutiveFullFailures: number = 0;
   palLoadHintSeen: Set<string> = new Set();
+
+  // Roleplay settings staged for the new-chat path (before a session exists).
+  // Applied to the session on creation, then reset to defaults.
+  newChatRoleplayConfig: RoleplayConfig = {...defaultRoleplayConfig};
 
   constructor() {
     makeAutoObservable(this);
@@ -265,6 +519,11 @@ class ChatSessionStore {
       // Convert to SessionMetaData format
       const sessionMetadata: SessionMetaData[] = [];
 
+      // Roleplay settings live in AsyncStorage; load them in one batch.
+      const roleplayExtras = await this.loadAllRoleplayExtras(
+        sessions.map(item => item.id),
+      );
+
       for (const session of sessions) {
         // Use metadata-only method instead of full getSessionById
         const sessionData =
@@ -298,6 +557,9 @@ class ChatSessionStore {
           settingsSource: (session.settingsSource as 'pal' | 'custom') || 'pal',
           pinned: session.pinned || false,
           messagesLoaded: false, // Mark as not loaded for lazy loading
+          roleplayConfig: roleplayExtras.get(session.id)?.roleplayConfig,
+          groupPalIds: roleplayExtras.get(session.id)?.groupPalIds,
+          activeSpeakerPalId: roleplayExtras.get(session.id)?.activeSpeakerPalId,
         });
       }
 
@@ -325,6 +587,7 @@ class ChatSessionStore {
   async deleteSession(id: string): Promise<void> {
     try {
       await chatSessionRepository.deleteSession(id);
+      await this.removeRoleplayExtras([id]);
 
       if (id === this.activeSessionId) {
         this.resetActiveSession();
@@ -339,8 +602,7 @@ class ChatSessionStore {
       console.error('Failed to delete session:', error);
     }
   }
-
-  async duplicateSession(id: string) {
+async duplicateSession(id: string) {
     const session = this.sessions.find(s => s.id === id);
     if (session) {
       await this.createNewSession(
@@ -348,6 +610,21 @@ class ChatSessionStore {
         session.messages,
         session.completionSettings,
       );
+
+      // Carry the roleplay settings and group over to the copy.
+      const copy = this.sessions.find(s => s.id === this.activeSessionId);
+      if (copy && copy.id !== session.id) {
+        runInAction(() => {
+          copy.roleplayConfig = session.roleplayConfig
+            ? {...session.roleplayConfig}
+            : copy.roleplayConfig;
+          copy.groupPalIds = session.groupPalIds
+            ? [...session.groupPalIds]
+            : undefined;
+          copy.activeSpeakerPalId = session.activeSpeakerPalId;
+        });
+        await this.persistRoleplayExtras(copy);
+      }
     }
   }
 
@@ -490,7 +767,7 @@ class ChatSessionStore {
       const palIdForSettings =
         this.newChatSettingsSource === 'pal' ? this.newChatPalId : undefined;
       const settings = await this.resolveCompletionSettings(
-        undefined,
+undefined,
         palIdForSettings,
       );
       await this.createNewSession(NEW_SESSION_TITLE, [message], settings);
@@ -633,6 +910,9 @@ class ChatSessionStore {
         metaData.activePalId = this.newChatPalId;
       }
 
+      // Roleplay settings staged in the new-chat path move into the session.
+      metaData.roleplayConfig = {...this.newChatRoleplayConfig};
+
       await this.updateSessionTitle(metaData);
 
       runInAction(() => {
@@ -641,12 +921,13 @@ class ChatSessionStore {
         this.newChatPalId = undefined;
         this.newChatThinkingOverride = undefined;
         this.newChatReasoningEffort = undefined;
+        this.newChatRoleplayConfig = {...defaultRoleplayConfig};
       });
+      await this.persistRoleplayExtras(metaData);
     } catch (error) {
       console.error('Failed to create new session:', error);
     }
   }
-
   private streamingThrottleTimer: NodeJS.Timeout | null = null;
   /**
    * Pending throttled update. Discriminated so the same throttle slot
@@ -879,8 +1160,7 @@ class ChatSessionStore {
     } catch (error) {
       console.error('Failed to update message:', error);
     }
-  }
-
+    }
   /**
    * Append a new step to an `assistant_turn` row. Writes the whole
    * `steps` array wholesale (no shallow-merge tricks — see Persistence
@@ -925,8 +1205,7 @@ class ChatSessionStore {
       console.error('Failed to persist pushAgentStep:', error);
     }
   }
-
-  /**
+/**
    * Replace the active (last) step's `toolCalls` array with the
    * runner's authoritative normalized list. Called from the hook
    * once per step on `step_finished`, with ids that match the
@@ -1082,7 +1361,6 @@ class ChatSessionStore {
             this.activeSessionId,
             'custom',
           );
-
           // Update local state directly - no need to reload from database
           runInAction(() => {
             session.completionSettings = settings;
@@ -1311,8 +1589,7 @@ class ChatSessionStore {
           const updatedSession = await chatSessionRepository.getSessionById(
             this.activeSessionId,
           );
-
-          // Update local state
+            // Update local state
           runInAction(() => {
             session.messages =
               updatedSession?.messages?.map(msg => msg.toMessageObject()) || [];
@@ -1396,6 +1673,7 @@ class ChatSessionStore {
 
       // Delete from database
       await chatSessionRepository.deleteSessions(idsToDelete);
+      await this.removeRoleplayExtras(idsToDelete);
 
       // Check if active session was deleted
       const wasActiveSessionDeleted =
@@ -1496,6 +1774,532 @@ class ChatSessionStore {
       console.error('Failed to toggle pin session:', error);
     }
   }
+// ---------------------------------------------------------------------------
+  // Roleplay: persistence (AsyncStorage, one key per session)
+  // ---------------------------------------------------------------------------
+
+  private roleplayStorageKey(sessionId: string): string {
+    return `${ROLEPLAY_STORAGE_PREFIX}${sessionId}`;
+  }
+
+  private async persistRoleplayExtras(session: SessionMetaData): Promise<void> {
+    try {
+      await AsyncStorage.setItem(
+        this.roleplayStorageKey(session.id),
+        JSON.stringify({
+          roleplayConfig: session.roleplayConfig,
+          groupPalIds: session.groupPalIds,
+          activeSpeakerPalId: session.activeSpeakerPalId,
+        }),
+      );
+    } catch (error) {
+      console.error('Failed to save roleplay settings:', error);
+    }
+  }
+
+  private async loadAllRoleplayExtras(
+    sessionIds: string[],
+  ): Promise<Map<string, RoleplayExtras>> {
+    const result = new Map<string, RoleplayExtras>();
+    if (sessionIds.length === 0) {
+      return result;
+    }
+    try {
+      const entries = await AsyncStorage.multiGet(
+        sessionIds.map(id => this.roleplayStorageKey(id)),
+      );
+      entries.forEach(([key, value], index) => {
+        const extras = parseRoleplayExtras(value);
+        if (extras) {
+          result.set(sessionIds[index] ?? key, extras);
+        }
+      });
+    } catch (error) {
+      console.error('Failed to load roleplay settings:', error);
+    }
+    return result;
+  }
+
+  private async removeRoleplayExtras(sessionIds: string[]): Promise<void> {
+    if (sessionIds.length === 0) {
+      return;
+    }
+    try {
+      await AsyncStorage.multiRemove(
+        sessionIds.map(id => this.roleplayStorageKey(id)),
+      );
+    } catch (error) {
+      console.error('Failed to remove roleplay settings:', error);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Roleplay: session settings (RoleplayConfig)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Effective roleplay config: the session's own, or the staged one for the
+   * not-yet-created new chat.
+   */
+  getRoleplayConfig(sessionId?: string): RoleplayConfig {
+    const id = sessionId ?? this.activeSessionId;
+    if (id) {
+      const session = this.sessions.find(s => s.id === id);
+      return {...defaultRoleplayConfig, ...(session?.roleplayConfig ?? {})};
+    }
+    return {...defaultRoleplayConfig, ...this.newChatRoleplayConfig};
+  }
+
+  async updateRoleplayConfig(updates: Partial<RoleplayConfig>): Promise<void> {
+    if (this.activeSessionId) {
+      const session = this.sessions.find(s => s.id === this.activeSessionId);
+      if (!session) {
+        return;
+      }
+      runInAction(() => {
+        session.roleplayConfig = {
+          ...this.getRoleplayConfig(session.id),
+          ...updates,
+        };
+      });
+      await this.persistRoleplayExtras(session);
+    } else {
+      runInAction(() => {
+        this.newChatRoleplayConfig = {
+          ...this.newChatRoleplayConfig,
+          ...updates,
+        };
+      });
+    }
+  }
+
+  async resetRoleplayConfig(): Promise<void> {
+    await this.updateRoleplayConfig({...defaultRoleplayConfig});
+  }
+
+  async setModelSystemOverride(value: string): Promise<void> {
+    await this.updateRoleplayConfig({modelSystemOverride: value});
+  }
+
+  async setDepthPrompt(value: string): Promise<void> {
+    await this.updateRoleplayConfig({depthPrompt: value});
+  }
+
+  async setPrefill(value: string): Promise<void> {
+    await this.updateRoleplayConfig({prefill: value});
+  }
+
+  async setIs3BFocusMode(value: boolean): Promise<void> {
+    await this.updateRoleplayConfig({is3BFocusMode: value});
+  }
+
+  async setAutoCleanResponse(value: boolean): Promise<void> {
+    await this.updateRoleplayConfig({autoCleanResponse: value});
+  }
+
+  // ---------------------------------------------------------------------------
+  // Roleplay: group chat (no model reload — only the prompt changes)
+  // ---------------------------------------------------------------------------
+
+  private getActiveSessionMeta(): SessionMetaData | undefined {
+    return this.activeSessionId
+      ? this.sessions.find(s => s.id === this.activeSessionId)
+      : undefined;
+  }
+
+  get currentGroupPalIds(): string[] {
+    return this.getActiveSessionMeta()?.groupPalIds ?? [];
+  }
+
+  get isGroupChat(): boolean {
+    return this.currentGroupPalIds.length >= 2;
+  }
+
+  /** Who answers next in the active session's group chat. */
+  get currentSpeakerPalId(): string | undefined {
+    const session = this.getActiveSessionMeta();
+    if (!session) {
+      return undefined;
+    }
+    const members = session.groupPalIds ?? [];
+    if (members.length >= 2) {
+      return session.activeSpeakerPalId &&
+        members.includes(session.activeSpeakerPalId)
+        ? session.activeSpeakerPalId
+        : members[0];
+    }
+    return session.activePalId;
+    }
+  async addPalToGroup(palId: string): Promise<boolean> {
+    const session = this.getActiveSessionMeta();
+    if (!session || !palStore.getPalById(palId)) {
+      return false;
+    }
+    const members = [...(session.groupPalIds ?? [])];
+    if (members.includes(palId)) {
+      return true;
+    }
+    // The session's own pal becomes the first member of a new group.
+    if (
+      members.length === 0 &&
+      session.activePalId &&
+      session.activePalId !== palId
+    ) {
+      members.push(session.activePalId);
+    }
+    members.push(palId);
+    runInAction(() => {
+      session.groupPalIds = members;
+      if (
+        !session.activeSpeakerPalId ||
+        !members.includes(session.activeSpeakerPalId)
+      ) {
+        session.activeSpeakerPalId = members[0];
+      }
+    });
+    await this.persistRoleplayExtras(session);
+    return true;
+  }
+
+  async removePalFromGroup(palId: string): Promise<boolean> {
+    const session = this.getActiveSessionMeta();
+    if (!session || !(session.groupPalIds ?? []).includes(palId)) {
+      return false;
+    }
+    const members = (session.groupPalIds ?? []).filter(id => id !== palId);
+    runInAction(() => {
+      session.groupPalIds = members.length > 0 ? members : undefined;
+      if (session.activeSpeakerPalId === palId || members.length === 0) {
+        session.activeSpeakerPalId = members[0];
+      }
+    });
+    await this.persistRoleplayExtras(session);
+    return true;
+  }
+
+  async clearGroup(): Promise<void> {
+    const session = this.getActiveSessionMeta();
+    if (!session) {
+      return;
+    }
+    runInAction(() => {
+      session.groupPalIds = undefined;
+      session.activeSpeakerPalId = undefined;
+    });
+    await this.persistRoleplayExtras(session);
+  }
+
+  /** Chooses who answers next. The pal must already be in the group. */
+  async setActiveSpeaker(palId: string): Promise<boolean> {
+    const session = this.getActiveSessionMeta();
+    if (!session || !(session.groupPalIds ?? []).includes(palId)) {
+      return false;
+    }
+    runInAction(() => {
+      session.activeSpeakerPalId = palId;
+    });
+    await this.persistRoleplayExtras(session);
+    return true;
+  }
+
+  /** Round-robin: gives the floor to the next group member. */
+  async advanceSpeaker(): Promise<string | undefined> {
+    const session = this.getActiveSessionMeta();
+    const members = session?.groupPalIds ?? [];
+    if (!session || members.length < 2) {
+      return undefined;
+    }
+    const current = this.currentSpeakerPalId;
+    const next = members[(members.indexOf(current ?? '') + 1) % members.length];
+    await this.setActiveSpeaker(next);
+    return next;
+  }
+
+  /**
+   * Remembers which pal wrote an assistant message so group history can be
+   * tagged with the right [Name]: later. Call it after the reply is created.
+   */
+  async setMessageSpeaker(
+    messageId: string,
+    palId: string,
+    sessionId?: string,
+  ): Promise<void> {
+    await this.updateMessage(
+      messageId,
+      sessionId ?? this.activeSessionId ?? '',
+      {metadata: {speakerPalId: palId}} as any,
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Roleplay: unified prompt pipeline
+  // ---------------------------------------------------------------------------
+
+  private getRoleplayContext(sessionId?: string) {
+    const id = sessionId ?? this.activeSessionId ?? undefined;
+    const session = id ? this.sessions.find(s => s.id === id) : undefined;
+    const config = this.getRoleplayConfig(id);
+    const activePersona = palStore.activeUserPersona;
+    const userName = activePersona?.name?.trim() || 'User';
+
+    const groupIds = (session?.groupPalIds ?? []).filter(
+      palId => !!palStore.getPalById(palId),
+    );
+    const isGroup = groupIds.length >= 2;
+    const basePalId = session ? session.activePalId : this.newChatPalId;
+
+    let speakerPalId: string | undefined = basePalId;
+    if (isGroup) {
+      speakerPalId =
+        session?.activeSpeakerPalId &&
+        groupIds.includes(session.activeSpeakerPalId)
+          ? session.activeSpeakerPalId
+          : groupIds[0];
+    }
+
+    const speakerPal = speakerPalId
+      ? palStore.getPalById(speakerPalId)
+      : undefined;
+    const speakerName = speakerPal?.name?.trim() || 'Assistant';
+    const otherNames = isGroup
+      ? groupIds
+          .filter(palId => palId !== speakerPalId)
+          .map(palId => palStore.getPalById(palId)?.name?.trim())
+          .filter((name): name is string => !!name)
+      : [];
+
+    return {
+      id,
+      session,
+      config,
+      activePersona,
+      userName,
+      isGroup,
+      speakerPalId,
+      speakerPal,
+      speakerName,
+      otherNames,
+    };
+  }
+
+  /**
+   * Builds the full chat for the next generation, in this order:
+   * modelSystemOverride -> user persona -> character (or active group
+   * speaker) -> triggered lorebook entries -> history (3B focus aware) ->
+   * depthPrompt (glued in front of the latest user message) -> last message
+   * -> prefill (trailing assistant message).
+   *
+   * All parts before the history live in ONE leading system message, which
+   * works with every chat template. {{user}} / {{char}} are replaced
+   * everywhere. Text messages only (images/files are not handled here).
+  */
+  buildRoleplayMessages(
+    options: BuildRoleplayMessagesOptions = {},
+  ): RoleplayPromptResult {
+    const ctx = this.getRoleplayContext(options.sessionId);
+    const {session, config, activePersona, userName, isGroup} = ctx;
+    const {speakerPalId, speakerPal, speakerName, otherNames} = ctx;
+    const fill = (text: string) =>
+      applyRoleplayPlaceholders(text, userName, speakerName);
+
+    // 1. Chronological turns (the store keeps messages newest-first).
+    const rawMessages =
+      ctx.id && ctx.id === this.activeSessionId
+        ? this.currentSessionMessages
+        : session?.messages ?? [];
+    const isUser = options.isUserMessage ?? defaultIsUserMessage;
+    const turns: RoleplayTurn[] = [];
+    for (const message of [...rawMessages].reverse()) {
+      if (message.type !== 'text' && message.type !== 'assistant_turn') {
+        continue;
+      }
+      const text = (derivedText(message) ?? '').trim();
+      if (!text) {
+        continue; // e.g. the empty placeholder of the reply being generated
+      }
+      turns.push({
+        role: isUser(message) ? 'user' : 'assistant',
+        text,
+        speakerPalId: (message.metadata as any)?.speakerPalId,
+      });
+    }
+
+    // 2. Lorebook: scan recent turns before any trimming.
+    const triggered = palStore.getTriggeredEntries(
+      turns.slice(-LOREBOOK_CONTEXT_MESSAGES).map(turn => turn.text),
+    );
+
+    // 3. System message: override -> persona -> character -> lorebook.
+    const blocks: string[] = [];
+    if (config.modelSystemOverride.trim()) {
+      blocks.push(config.modelSystemOverride.trim());
+    }
+    if (activePersona) {
+      const lines = ['[User persona]'];
+      if (activePersona.name.trim()) {
+        lines.push(`Name: ${activePersona.name.trim()}`);
+      }
+      if (activePersona.gender.trim()) {
+        lines.push(`Gender: ${activePersona.gender.trim()}`);
+      }
+      if (activePersona.description.trim()) {
+        lines.push(`Description: ${activePersona.description.trim()}`);
+      }
+      blocks.push(lines.join('\n'));
+    }
+    const characterText = renderPalParameters(
+      (speakerPal?.systemPrompt || speakerPal?.description || '').trim(),
+      speakerPal?.parameters,
+    );
+    if (characterText) {
+      blocks.push(characterText);
+    }
+    if (isGroup) {
+      const scene = [
+        '[Group scene]',
+        `You are {{char}}. Reply only as {{char}} and never speak or act for {{user}}${
+          otherNames.length > 0 ? ' or the other characters' : ''
+        }.`,
+      ];
+      if (otherNames.length > 0) {
+        scene.push(`Other characters in the scene: ${otherNames.join(', ')}.`);
+      }
+      scene.push('Every message in the chat starts with the speaker in [Name]:.');
+      blocks.push(scene.join('\n'));
+    }
+    if (triggered.length > 0) {
+      blocks.push(
+        [
+          '[Lorebook]',
+          ...triggered.map(entry =>
+            entry.title.trim()
+              ? `${entry.title.trim()}: ${entry.content.trim()}`
+              : entry.content.trim(),
+          ),
+        ].join('\n'),
+      );
+    }
+
+    const messages: RoleplayChatMessage[] = [];
+    if (blocks.length > 0) {
+      messages.push({role: 'system', content: fill(blocks.join('\n\n'))});
+    }
+
+    // 4. History. 3B focus mode: greeting + last 8 turns, long *descriptions*
+    //    removed from everything except the newest turns.
+    let selected = turns;
+    if (config.is3BFocusMode) {
+      const total = turns.length;
+      selected = turns.flatMap((turn, index) => {
+        const isGreeting = index === 0 && turn.role === 'assistant';
+        const isRecent = index >= total - FOCUS_MODE_KEPT_TURNS;
+        if (!isGreeting && !isRecent) {
+          return [];
+        }
+        const isNewest = index >= total - FOCUS_MODE_FULL_TURNS;
+        return [isNewest ? turn : {...turn, text: stripLongActions(turn.text)}];
+      });
+    }
+
+    const fallbackName =
+      (session?.activePalId
+        ? palStore.getPalById(session.activePalId)?.name?.trim()
+        : undefined) || speakerName;
+    selected.forEach(turn => {
+      let content = turn.text;
+      if (isGroup && !hasSpeakerTag(content)) {
+        const name =
+          turn.role === 'user'
+            ? userName
+            : (turn.speakerPalId
+                ? palStore.getPalById(turn.speakerPalId)?.name?.trim()
+                : undefined) || fallbackName;
+        content = `[${name}]: ${content}`;
+      }
+      messages.push({role: turn.role, content: fill(content)});
+    });
+
+    // 5. depthPrompt: glued in front of the latest user message.
+    const depth = fill(config.depthPrompt.trim());
+    if (depth) {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === 'user') {
+          messages[i] = {
+            ...messages[i],
+            content: `${depth}\n\n${messages[i].content}`,
+          };
+          break;
+        }
+      }
+    }
+
+    // 6. prefill: start of the bot's reply (in a group it always carries the
+    //    speaker tag, which is what makes the chosen member answer).
+    const displayPrefill = config.prefill.trim() ? fill(config.prefill) : '';
+    const groupTag = isGroup ? `[${speakerName}]:` : '';
+    const prefill = isGroup
+      ? displayPrefill
+        ? `${groupTag} ${displayPrefill}`
+        : groupTag
+      : displayPrefill;
+    if (prefill) {
+      messages.push({role: 'assistant', content: prefill});
+    }
+
+    const extraStopWords = uniqueNonEmpty([
+      userName,
+      ...otherNames,
+    ]).flatMap(name => [`\n${name}:`, `\n[${name}]:`]);
+
+    return {
+      messages,
+      prefill,
+      displayPrefill,
+      speakerPalId,
+      speakerName,
+      userName,
+      isGroup,
+      extraStopWords,
+    };
+  }
+
+  /**
+   * Cleans a model reply: removes junk tags (<|im_end|>, [INST], ...) and
+   * cuts the text where the bot starts speaking as the user (userPersona.name)
+   * or, in a group, as another participant. Safe to call on every streamed
+   * partial. Does nothing when autoCleanResponse is off.
+   */
+  cleanModelResponse(text: string, sessionId?: string): string {
+    const ctx = this.getRoleplayContext(sessionId);
+    if (!ctx.config.autoCleanResponse) {
+      return text;
+    }
+    const cutNames = uniqueNonEmpty([
+      palStore.userPersona?.name,
+      ctx.userName,
+      ...ctx.otherNames,
+    ]);
+    const tagNames = ctx.isGroup
+      ? uniqueNonEmpty([ctx.speakerName, ...ctx.otherNames])
+      : [];
+    return cleanRoleplayText(text, cutNames, tagNames);
+  }
+
+  /**
+   * Turns the raw model output into the text to show/store: prepends the
+   * prefill (without the group tag) and applies cleanModelResponse.
+   * `built` is the result of the matching buildRoleplayMessages call.
+   */
+  finalizeRoleplayResponse(
+    rawOutput: string,
+    built: RoleplayPromptResult,
+    sessionId?: string,
+  ): string {
+    const combined = built.displayPrefill
+      ? built.displayPrefill + rawOutput
+      : rawOutput.trimStart();
+    return this.cleanModelResponse(combined, sessionId);
+  }
 
   /**
    * Resolves completion settings according to the precedence hierarchy:
@@ -1556,8 +2360,7 @@ class ChatSessionStore {
         },
       };
     }
-
-    // Apply session-specific settings based on explicit user choice
+      // Apply session-specific settings based on explicit user choice
     if (sessionId) {
       const session = this.sessions.find(s => s.id === sessionId);
 
